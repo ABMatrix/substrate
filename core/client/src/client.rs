@@ -51,6 +51,7 @@ use consensus::{
 	ImportResult, BlockOrigin, ForkChoiceStrategy,
 	SelectChain, self,
 };
+use header_metadata::{HeaderMetadata, TreeBackend, CachedHeaderMetadata};
 
 use crate::{
 	runtime_api::{
@@ -62,7 +63,7 @@ use crate::{
 		ClientImportOperation, Finalizer, ImportSummary,
 	},
 	blockchain::{
-		self, Info as ChainInfo, Backend as ChainBackend, LightHeader,
+		self, Info as ChainInfo, Backend as ChainBackend,
 		HeaderBackend as ChainHeaderBackend, ProvideCache, Cache,
 		well_known_cache_keys::Id as CacheKeyId,
 	},
@@ -958,12 +959,7 @@ impl<B, E, Block, RA> Client<B, E, Block, RA> where
 		};
 
 		let retracted = if is_new_best {
-			let route_from_best = crate::blockchain::tree_route(
-				|id| self.get_light_header(&id)?
-					.ok_or_else(|| Error::UnknownBlock(format!("{:?}", id))),
-				BlockId::Hash(info.best_hash),
-				BlockId::Hash(parent_hash),
-			)?;
+			let route_from_best = self.backend.blockchain().tree_route(info.best_hash, parent_hash)?;
 			route_from_best.retracted().iter().rev().map(|e| e.hash.clone()).collect()
 		} else {
 			Vec::default()
@@ -1093,12 +1089,7 @@ impl<B, E, Block, RA> Client<B, E, Block, RA> where
 			return Ok(());
 		}
 
-		let route_from_finalized = crate::blockchain::tree_route(
-			|id| self.get_light_header(&id)?
-				.ok_or_else(|| Error::UnknownBlock(format!("{:?}", id))),
-			BlockId::Hash(last_finalized),
-			BlockId::Hash(block),
-		)?;
+		let route_from_finalized = self.backend.blockchain().tree_route(last_finalized, block)?;
 
 		if let Some(retracted) = route_from_finalized.retracted().get(0) {
 			warn!("Safety violation: attempted to revert finalized block {:?} which is not in the \
@@ -1107,12 +1098,7 @@ impl<B, E, Block, RA> Client<B, E, Block, RA> where
 			return Err(error::Error::NotInFinalizedChain);
 		}
 
-		let route_from_best = crate::blockchain::tree_route(
-			|id| self.get_light_header(&id)?
-				.ok_or_else(|| Error::UnknownBlock(format!("{:?}", id))),
-			BlockId::Hash(best_block),
-			BlockId::Hash(block),
-		)?;
+		let route_from_best = self.backend.blockchain().tree_route(best_block, block)?;
 
 		// if the block is not a direct ancestor of the current best chain,
 		// then some other block is the common ancestor.
@@ -1244,16 +1230,6 @@ impl<B, E, Block, RA> Client<B, E, Block, RA> where
 		self.backend.blockchain().header(*id)
 	}
 
-	/// Get block light header.
-	pub fn get_light_header(&self, id: &BlockId<Block>) -> error::Result<Option<LightHeader<Block>>> {
-		self.backend.blockchain().get_light_header(*id)
-	}
-
-	/// Set block light header.
-	pub fn set_light_header(&self, data: LightHeader<Block>) {
-		self.backend.blockchain().set_light_header(data)
-	}
-
 	/// Get block body by id.
 	pub fn body(&self, id: &BlockId<Block>) -> error::Result<Option<Vec<<Block as BlockT>::Extrinsic>>> {
 		self.backend.blockchain().body(*id)
@@ -1326,6 +1302,61 @@ impl<B, E, Block, RA> Client<B, E, Block, RA> where
 	}
 }
 
+impl<B, E, Block, RA> HeaderMetadata<Block> for Client<B, E, Block, RA> where
+	B: backend::Backend<Block, Blake2Hasher>,
+	E: CallExecutor<Block, Blake2Hasher>,
+	Block: BlockT<Hash=H256>,
+{
+	type Metadata = CachedHeaderMetadata<Block>;
+	type Error = error::Error;
+
+	fn header_metadata(&self, hash: Block::Hash) -> Result<Self::Metadata, Self::Error> {
+		self.backend.blockchain().header_metadata(hash)
+	}
+
+	fn insert_header_metadata(&self, hash: Block::Hash, metadata: Self::Metadata) {
+		self.backend.blockchain().insert_header_metadata(hash, metadata)
+	}
+
+	fn remove_header_metadata(&self, hash: Block::Hash) {
+		self.backend.blockchain().remove_header_metadata(hash)
+	}
+}
+
+
+impl<B, E, Block, RA> TreeBackend<Block> for Client<B, E, Block, RA> where
+	B: backend::Backend<Block, Blake2Hasher>,
+	E: CallExecutor<Block, Blake2Hasher>,
+	Block: BlockT<Hash=H256>,
+{}
+
+impl<B, E, Block, RA> HeaderMetadata<Block> for &Client<B, E, Block, RA> where
+	B: backend::Backend<Block, Blake2Hasher>,
+	E: CallExecutor<Block, Blake2Hasher>,
+	Block: BlockT<Hash=H256>,
+{
+	type Metadata = CachedHeaderMetadata<Block>;
+	type Error = error::Error;
+
+	fn header_metadata(&self, hash: Block::Hash) -> Result<Self::Metadata, Self::Error> {
+		(**self).backend.blockchain().header_metadata(hash)
+	}
+
+	fn insert_header_metadata(&self, hash: Block::Hash, metadata: Self::Metadata) {
+		(**self).backend.blockchain().insert_header_metadata(hash, metadata)
+	}
+
+	fn remove_header_metadata(&self, hash: Block::Hash) {
+		(**self).backend.blockchain().remove_header_metadata(hash)
+	}
+}
+
+impl<B, E, Block, RA> TreeBackend<Block> for &Client<B, E, Block, RA> where
+	B: backend::Backend<Block, Blake2Hasher>,
+	E: CallExecutor<Block, Blake2Hasher>,
+	Block: BlockT<Hash=H256>,
+{}
+
 impl<B, E, Block, RA> ProvideUncles<Block> for Client<B, E, Block, RA> where
 	B: backend::Backend<Block, Blake2Hasher>,
 	E: CallExecutor<Block, Blake2Hasher>,
@@ -1348,14 +1379,6 @@ impl<B, E, Block, RA> ChainHeaderBackend<Block> for Client<B, E, Block, RA> wher
 {
 	fn header(&self, id: BlockId<Block>) -> error::Result<Option<Block::Header>> {
 		self.backend.blockchain().header(id)
-	}
-
-	fn get_light_header(&self, id: BlockId<Block>) -> error::Result<Option<LightHeader<Block>>> {
-		self.backend.blockchain().get_light_header(id)
-	}
-
-	fn set_light_header(&self, data: LightHeader<Block>) {
-		self.backend.blockchain().set_light_header(data)
 	}
 
 	fn info(&self) -> blockchain::Info<Block> {
@@ -1383,14 +1406,6 @@ impl<B, E, Block, RA> ChainHeaderBackend<Block> for &Client<B, E, Block, RA> whe
 {
 	fn header(&self, id: BlockId<Block>) -> error::Result<Option<Block::Header>> {
 		(**self).backend.blockchain().header(id)
-	}
-
-	fn get_light_header(&self, id: BlockId<Block>) -> error::Result<Option<LightHeader<Block>>> {
-		(**self).get_light_header(&id)
-	}
-
-	fn set_light_header(&self, data: LightHeader<Block>) {
-		(**self).set_light_header(data)
 	}
 
 	fn info(&self) -> blockchain::Info<Block> {
@@ -1806,7 +1821,7 @@ where
 /// Utility methods for the client.
 pub mod utils {
 	use super::*;
-	use crate::{blockchain, error};
+	use crate::error;
 	use primitives::H256;
 	use std::borrow::Borrow;
 
@@ -1820,7 +1835,7 @@ pub mod utils {
 		client: &'a T,
 		current: Option<(H, H)>,
 	) -> impl Fn(&H256, &H256) -> Result<bool, error::Error> + 'a
-		where T: ChainHeaderBackend<Block>,
+		where T: ChainHeaderBackend<Block> + TreeBackend<Block, Error=error::Error>,
 	{
 		move |base, hash| {
 			if base == hash { return Ok(false); }
@@ -1839,15 +1854,9 @@ pub mod utils {
 				}
 			}
 
-			let ancestor = blockchain::lowest_common_ancestor(
-				|id| client.get_light_header(&id)?
-					.ok_or_else(|| Error::UnknownBlock(format!("{:?}", id))),
-				|data| client.set_light_header(data),
-				BlockId::Hash(*hash),
-				BlockId::Hash(*base),
-			)?;
+			let ancestor = client.lowest_common_ancestor(*hash, *base)?;
 
-			Ok(ancestor.0 == *base)
+			Ok(ancestor.hash == *base)
 		}
 	}
 }
