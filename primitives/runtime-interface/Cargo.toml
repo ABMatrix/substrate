@@ -32,7 +32,7 @@ sp-state-machine = { version = "0.12.0", path = "../state-machine" }
 sp-core = { version = "6.0.0", path = "../core" }
 sp-io = { version = "6.0.0", path = "../io" }
 rustversion = "1.0.6"
-trybuild = "1.0.60"
+trybuild = "1.0.73"
 
 [features]
 default = [ "std" ]
